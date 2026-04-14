@@ -9,13 +9,18 @@ import io
 
 app = FastAPI()
 
-# Load model
-model = tf.keras.models.load_model('brain_tumor_model.keras')
+# ---------- Lazy Load Model ----------
+model = None
+
+def get_model():
+    global model
+    if model is None:
+        model = tf.keras.models.load_model('brain_tumor_model.keras')
+    return model
 
 IMG_SIZE = (224, 224)
 class_labels = ['glioma', 'meningioma', 'no_tumor', 'pituitary']
 
-# 🔴 IMPORTANT: verify this layer name once
 LAST_CONV_LAYER = "conv5_block3_out"
 
 # ---------- Request Schema ----------
@@ -29,7 +34,7 @@ def preprocess(img):
     return np.expand_dims(img, axis=0)
 
 # ---------- Grad-CAM ----------
-def get_gradcam_heatmap(img_array):
+def get_gradcam_heatmap(model, img_array):
     grad_model = tf.keras.models.Model(
         [model.inputs],
         [model.get_layer(LAST_CONV_LAYER).output, model.output]
@@ -47,7 +52,12 @@ def get_gradcam_heatmap(img_array):
     heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
 
-    heatmap = tf.maximum(heatmap, 0) / tf.reduce_max(heatmap)
+    # avoid division by zero crash
+    max_val = tf.reduce_max(heatmap)
+    if max_val == 0:
+        return np.zeros((224, 224))
+
+    heatmap = tf.maximum(heatmap, 0) / max_val
     return heatmap.numpy()
 
 # ---------- Convert image to base64 ----------
@@ -71,24 +81,30 @@ def create_overlay(original_img, heatmap):
 # ---------- API ----------
 @app.post("/predict")
 async def predict(request: ImageRequest):
-    # Decode base64
-    image_bytes = base64.b64decode(request.image_base64)
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        # Decode base64
+        image_bytes = base64.b64decode(request.image_base64)
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    img_array = preprocess(img)
+        img_array = preprocess(img)
 
-    preds = model.predict(img_array)
-    pred_class = class_labels[np.argmax(preds)]
-    confidence = float(np.max(preds))
+        model = get_model()
 
-    # Grad-CAM
-    heatmap = get_gradcam_heatmap(img_array)
+        preds = model.predict(img_array)
+        pred_class = class_labels[np.argmax(preds)]
+        confidence = float(np.max(preds))
 
-    overlay, heatmap_img = create_overlay(img, heatmap)
+        # Grad-CAM
+        heatmap = get_gradcam_heatmap(model, img_array)
 
-    return {
-        "prediction": pred_class,
-        "confidence": confidence,
-        "gradcam_overlay": image_to_base64(overlay),
-        "heatmap": image_to_base64(heatmap_img)
-    }
+        overlay, heatmap_img = create_overlay(img, heatmap)
+
+        return {
+            "prediction": pred_class,
+            "confidence": confidence,
+            "gradcam_overlay": image_to_base64(overlay),
+            "heatmap": image_to_base64(heatmap_img)
+        }
+
+    except Exception as e:
+        return {"error": str(e)}

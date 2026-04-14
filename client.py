@@ -26,9 +26,9 @@ print("Confidence:", data["confidence"])
 
 # Save returned images
 with open("gradcam_overlay.png", "wb") as f:
-    f.write(base64.b64decode(data["gradcam_overlay_base64"]))
+    f.write(base64.b64decode(data["gradcam_overlay"]))
 
 with open("heatmap.png", "wb") as f:
-    f.write(base64.b64decode(data["heatmap_base64"]))
+    f.write(base64.b64decode(data["heatmap"]))
 
 print("Saved Grad-CAM overlay and heatmap images.")
