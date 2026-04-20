@@ -1,109 +1,106 @@
 import base64
-from fastapi import FastAPI
-from pydantic import BaseModel
-import tensorflow as tf
-import numpy as np
-import cv2
-from PIL import Image
+import gc
 import io
+import os
 
-app = FastAPI()
+import cv2
+import numpy as np
+import tensorflow as tf
+from fastapi import FastAPI
+from PIL import Image
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
-# ---------- Lazy Load Model ----------
-model = None
+# 1. Force TensorFlow to use CPU and minimize memory bloat
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-def get_model():
-    global model
-    if model is None:
-        model = tf.keras.models.load_model('brain_tumor_model.keras')
-    return model
+# Global model containers
+models = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load model once on startup
+    main_model = tf.keras.models.load_model('brain_tumor_model.keras')
+    
+    # Pre-build the Grad-CAM model to avoid creating new objects per request
+    grad_model = tf.keras.models.Model(
+        [main_model.inputs],
+        [main_model.get_layer("conv5_block3_out").output, main_model.output]
+    )
+    
+    models["main"] = main_model
+    models["grad"] = grad_model
+    yield
+    # Cleanup on shutdown
+    models.clear()
+    tf.keras.backend.clear_session()
+
+app = FastAPI(lifespan=lifespan)
 
 IMG_SIZE = (224, 224)
 class_labels = ['glioma', 'meningioma', 'no_tumor', 'pituitary']
 
-LAST_CONV_LAYER = "conv5_block3_out"
-
-# ---------- Request Schema ----------
 class ImageRequest(BaseModel):
     image_base64: str
 
-# ---------- Preprocess ----------
 def preprocess(img):
     img = img.resize(IMG_SIZE)
-    img = np.array(img) / 255.0
-    return np.expand_dims(img, axis=0)
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    return np.expand_dims(img_array, axis=0)
 
-# ---------- Grad-CAM ----------
-def get_gradcam_heatmap(model, img_array):
-    grad_model = tf.keras.models.Model(
-        [model.inputs],
-        [model.get_layer(LAST_CONV_LAYER).output, model.output]
-    )
-
-    with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_array)
-        pred_index = tf.argmax(predictions[0])
-        class_channel = predictions[:, pred_index]
-
-    grads = tape.gradient(class_channel, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-    conv_outputs = conv_outputs[0]
-    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-
-    # avoid division by zero crash
-    max_val = tf.reduce_max(heatmap)
-    if max_val == 0:
-        return np.zeros((224, 224))
-
-    heatmap = tf.maximum(heatmap, 0) / max_val
-    return heatmap.numpy()
-
-# ---------- Convert image to base64 ----------
-def image_to_base64(img_array):
-    _, buffer = cv2.imencode('.png', img_array)
-    return base64.b64encode(buffer).decode('utf-8')
-
-# ---------- Overlay ----------
-def create_overlay(original_img, heatmap):
-    img = cv2.cvtColor(np.array(original_img), cv2.COLOR_RGB2BGR)
-    img = cv2.resize(img, IMG_SIZE)
-
-    heatmap = cv2.resize(heatmap, IMG_SIZE)
-    heatmap = np.uint8(255 * heatmap)
-
-    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(img, 0.6, heatmap_color, 0.4, 0)
-
-    return overlay, heatmap_color
-
-# ---------- API ----------
 @app.post("/predict")
 async def predict(request: ImageRequest):
     try:
-        # Decode base64
+        # Decode image
         image_bytes = base64.b64decode(request.image_base64)
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
         img_array = preprocess(img)
 
-        model = get_model()
+        # 2. Grad-CAM Calculation (Using the pre-built grad_model)
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = models["grad"](img_array)
+            pred_index = tf.argmax(predictions[0])
+            class_channel = predictions[:, pred_index]
 
-        preds = model.predict(img_array)
-        pred_class = class_labels[np.argmax(preds)]
-        confidence = float(np.max(preds))
+        # Extract data for prediction return
+        pred_class = class_labels[pred_index]
+        confidence = float(predictions[0][pred_index])
 
-        # Grad-CAM
-        heatmap = get_gradcam_heatmap(model, img_array)
+        # Heatmap math
+        grads = tape.gradient(class_channel, conv_outputs)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        
+        conv_outputs = conv_outputs[0]
+        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
 
-        overlay, heatmap_img = create_overlay(img, heatmap)
+        # Normalize heatmap
+        max_val = tf.reduce_max(heatmap)
+        heatmap = tf.maximum(heatmap, 0) / (max_val if max_val > 0 else 1.0)
+        heatmap_np = heatmap.numpy()
+
+        # 3. Process Visuals (Overlay)
+        img_cv = cv2.cvtColor(np.array(img.resize(IMG_SIZE)), cv2.COLOR_RGB2BGR)
+        heatmap_resized = cv2.resize(heatmap_np, IMG_SIZE)
+        heatmap_uint8 = np.uint8(255 * heatmap_resized)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+        
+        overlay = cv2.addWeighted(img_cv, 0.6, heatmap_color, 0.4, 0)
+
+        # Encode results
+        _, buf_ov = cv2.imencode('.png', overlay)
+        _, buf_hm = cv2.imencode('.png', heatmap_color)
+
+        # 4. Critical Cleanup
+        del img_array, conv_outputs, predictions, heatmap, grads, img_cv
+        gc.collect()
 
         return {
             "prediction": pred_class,
             "confidence": confidence,
-            "gradcam_overlay": image_to_base64(overlay),
-            "heatmap": image_to_base64(heatmap_img)
+            "gradcam_overlay": base64.b64encode(buf_ov).decode('utf-8'),
+            "heatmap": base64.b64encode(buf_hm).decode('utf-8')
         }
 
     except Exception as e:
